@@ -1,0 +1,196 @@
+# Cuts a Wand Core release from a tag of the private source repository (wandapp/wand2).
+# Started by release/core.sh in the source repo: gh workflow run release.yml -R wandapp/core -f ref=core-v<version>
+#
+# Needs: secret SOURCE_DEPLOY_KEY (read-only deploy key of wandapp/wand2), variable UPDATE_PUBKEY (public
+# update key pinned into the bundles), secret UPDATE_KEY in the environments `beta` and `stable` (the
+# private signing key; require approval on `stable`).
+name: release
+run-name: release ${{ inputs.ref }}
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Source tag, e.g. core-v0.5.0-beta.1"
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: release
+  cancel-in-progress: false
+env:
+  SOURCE_REPO: wandapp/wand2
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      build: ${{ steps.v.outputs.build }}
+      channel: ${{ steps.v.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: src
+      - id: v
+        env:
+          REF: ${{ inputs.ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          case $REF in
+            core-v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "ref must be core-v<version>" >&2; exit 1;;
+          esac
+          version=${REF#core-v}
+          printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$' \
+            || { echo "version must be X.Y.Z or X.Y.Z-beta.N" >&2; exit 1; }
+          cargo=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' src/core/Cargo.toml | head -1)
+          [ "$cargo" = "$version" ] || { echo "tag version $version differs from core/Cargo.toml ($cargo)" >&2; exit 1; }
+          if gh release view "v$version" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release v$version already exists; releases are never overwritten" >&2; exit 1
+          fi
+          case $version in *-beta.*) channel=beta;; *) channel=stable;; esac
+          {
+            echo "version=$version"
+            echo "build=$(date -u +%Y%m%d%H%M)"
+            echo "channel=$channel"
+          } >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: src
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src/core
+      - run: cargo test --workspace --locked
+        working-directory: src/core
+
+  build:
+    needs: [prepare, test]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { platform: macos-arm64, runner: macos-15 }
+          - { platform: linux-x64, runner: ubuntu-24.04 }
+          - { platform: linux-arm64, runner: ubuntu-24.04-arm }
+          - { platform: web, runner: ubuntu-24.04 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: src
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.platform == 'macos-arm64'
+      - name: Build
+        env:
+          UPDATE_PUBKEY: ${{ vars.UPDATE_PUBKEY }}
+          WAND_CORE_BUILD: ${{ needs.prepare.outputs.build }}
+          WAND_CHANNEL: ${{ needs.prepare.outputs.channel }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -eu
+          [ -n "$UPDATE_PUBKEY" ] || { echo "repository variable UPDATE_PUBKEY is empty" >&2; exit 1; }
+          printf '%s\n' "$UPDATE_PUBKEY" > "$RUNNER_TEMP/update.pub"
+          WAND_UPDATE_PUBKEY_FILE="$RUNNER_TEMP/update.pub" src/dist/build.sh "$PLATFORM" >/dev/null
+          ls -l src/output
+      - uses: actions/upload-artifact@v4
+        with:
+          name: out-${{ matrix.platform }}
+          path: src/output/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.prepare.outputs.channel }}
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      BUILD: ${{ needs.prepare.outputs.build }}
+      CHANNEL: ${{ needs.prepare.outputs.channel }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: src
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: out-*
+          merge-multiple: true
+          path: src/output
+      - name: Sign the manifest
+        env:
+          UPDATE_KEY: ${{ secrets.UPDATE_KEY }}
+          UPDATE_PUBKEY: ${{ vars.UPDATE_PUBKEY }}
+        run: |
+          set -eu
+          [ -n "$UPDATE_KEY" ] || { echo "secret UPDATE_KEY is empty in environment $CHANNEL" >&2; exit 1; }
+          # publish.py needs runnable gatewayd and updater: take them from the linux-x64 bundle.
+          tar -xzf "src/output/wand-core-$VERSION-linux-x64.tar.gz" -C "$RUNNER_TEMP"
+          umask 077
+          printf '%s\n' "$UPDATE_KEY" > "$RUNNER_TEMP/update.key"
+          python3 src/dist/publish.py --key "$RUNNER_TEMP/update.key" --out release \
+            --core-version "$VERSION" --core-build "$BUILD" --web-version "$VERSION" --web-build "$BUILD" \
+            --url-base "https://github.com/wandapp/core/releases/download/v$VERSION" \
+            --channel "$CHANNEL" --bin-dir "$RUNNER_TEMP/wand-core/bin" >/dev/null
+          rm -f "$RUNNER_TEMP/update.key"
+          # Verify the signature the way hosts do: the updater against a throwaway prefix pinned to the public key.
+          mkdir -p "$RUNNER_TEMP/prefix"
+          printf '%s\n' "$UPDATE_PUBKEY" > "$RUNNER_TEMP/prefix/trust.pub"
+          "$RUNNER_TEMP/wand-core/bin/updater" plan --prefix "$RUNNER_TEMP/prefix" \
+            --manifest "file://$PWD/release/manifest.json" > "$RUNNER_TEMP/plan.json"
+          python3 - "$RUNNER_TEMP/plan.json" <<'PY'
+          import json, sys
+          plan = json.load(open(sys.argv[1]))
+          if not plan["configured"] or plan["error"]:
+              sys.exit("manifest does not verify against UPDATE_PUBKEY: " + plan["error"])
+          print("manifest signature verified; offered:", plan["offered"])
+          PY
+          ls -l release
+      - name: Publish
+        run: |
+          set -eu
+          cd release
+          # Order matters: the versioned release first (archives and manifest), the pointers last.
+          if gh release view "v$VERSION" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release v$VERSION already exists; releases are never overwritten" >&2; exit 1
+          fi
+          if [ "$CHANNEL" = beta ]; then flags="--prerelease --latest=false"; else flags="--latest"; fi
+          # shellcheck disable=SC2086
+          gh release create "v$VERSION" -R "$GITHUB_REPOSITORY" --title "Wand Core $VERSION" \
+            --notes "Wand Core $VERSION (build $BUILD)" $flags \
+            "wand-core-$VERSION-macos-arm64.tar.gz" "wand-core-$VERSION-linux-x64.tar.gz" \
+            "wand-core-$VERSION-linux-arm64.tar.gz" "wand-web-$VERSION.tar.gz" \
+            manifest.json manifest.json.sig
+          # The Beta entry point always holds the newest manifest, stable or beta.
+          if gh release view beta -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload beta -R "$GITHUB_REPOSITORY" manifest.json manifest.json.sig --clobber
+          else
+            gh release create beta -R "$GITHUB_REPOSITORY" --prerelease --latest=false --title "Beta" \
+              --notes "Moving pointer to the newest signed manifest." manifest.json manifest.json.sig
+          fi
+          echo "published v$VERSION ($CHANNEL)"
