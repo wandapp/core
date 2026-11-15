@@ -13,6 +13,14 @@ on:
         description: "Source tag, e.g. core-v0.5.0-beta.1"
         required: true
         type: string
+      build:
+        description: "Build number of the locally signed macOS archive"
+        required: true
+        type: string
+      macos_sha256:
+        description: "SHA-256 of the macOS archive in draft v<version>"
+        required: true
+        type: string
 permissions:
   contents: read
 concurrency:
@@ -39,6 +47,8 @@ jobs:
         env:
           REF: ${{ inputs.ref }}
           GH_TOKEN: ${{ github.token }}
+          BUILD: ${{ inputs.build }}
+          MACOS_SHA256: ${{ inputs.macos_sha256 }}
         run: |
           set -eu
           case $REF in
@@ -50,13 +60,14 @@ jobs:
             || { echo "version must be X.Y.Z or X.Y.Z-beta.N" >&2; exit 1; }
           cargo=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' src/core/Cargo.toml | head -1)
           [ "$cargo" = "$version" ] || { echo "tag version $version differs from core/Cargo.toml ($cargo)" >&2; exit 1; }
-          if gh release view "v$version" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release v$version already exists; releases are never overwritten" >&2; exit 1
-          fi
+          [ "$(gh release view "v$version" -R "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)" = true ] \
+            || { echo "a draft with the locally signed macOS archive is required" >&2; exit 1; }
+          printf '%s\n' "$BUILD" | grep -Eq '^[0-9]{12}$' || exit 1
+          printf '%s\n' "$MACOS_SHA256" | grep -Eq '^[a-f0-9]{64}$' || exit 1
           case $version in *-beta.*) channel=beta;; *) channel=stable;; esac
           {
             echo "version=$version"
-            echo "build=$(date -u +%Y%m%d%H%M)"
+            echo "build=$BUILD"
             echo "channel=$channel"
           } >> "$GITHUB_OUTPUT"
 
@@ -101,6 +112,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         if: matrix.platform == 'macos-arm64'
       - name: Build
+        if: matrix.platform != 'macos-arm64'
         env:
           UPDATE_PUBKEY: ${{ vars.UPDATE_PUBKEY }}
           WAND_CORE_BUILD: ${{ needs.prepare.outputs.build }}
@@ -112,6 +124,44 @@ jobs:
           printf '%s\n' "$UPDATE_PUBKEY" > "$RUNNER_TEMP/update.pub"
           WAND_UPDATE_PUBKEY_FILE="$RUNNER_TEMP/update.pub" src/dist/build.sh "$PLATFORM" >/dev/null
           ls -l src/output
+      - name: Verify the locally signed macOS archive
+        if: matrix.platform == 'macos-arm64'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD: ${{ needs.prepare.outputs.build }}
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
+          MACOS_SHA256: ${{ inputs.macos_sha256 }}
+          UPDATE_PUBKEY: ${{ vars.UPDATE_PUBKEY }}
+        run: |
+          set -eu
+          mkdir -p src/output
+          archive="wand-core-$VERSION-macos-arm64.tar.gz"
+          gh release download "v$VERSION" -R "$GITHUB_REPOSITORY" --pattern "$archive" --dir src/output
+          actual=$(shasum -a 256 "src/output/$archive" | cut -d ' ' -f 1)
+          [ "$actual" = "$MACOS_SHA256" ] || { echo 'macOS archive digest changed' >&2; exit 1; }
+          tar -xzf "src/output/$archive" -C "$RUNNER_TEMP"
+          python3 - "$RUNNER_TEMP/wand-core" <<'PY'
+          import json, os, pathlib, re, subprocess, sys
+          root = pathlib.Path(sys.argv[1])
+          meta = json.loads((root / 'build.json').read_text())
+          head = subprocess.check_output(['git', '-C', 'src', 'rev-parse', 'HEAD'], text=True).strip()
+          assert re.fullmatch('[a-f0-9]{7,40}', meta['commit']) and head.startswith(meta['commit']), 'source commit mismatch'
+          assert (meta['version'], str(meta['build']), meta['platform'], meta['channel']) == (os.environ['VERSION'], os.environ['BUILD'], 'macos-arm64', os.environ['CHANNEL'])
+          assert (root / 'update-key.pub').read_text().strip() == os.environ['UPDATE_PUBKEY'].strip()
+          launcher = (root / 'macos-launcher.sh').read_bytes()
+          assert set(p.name for p in (root / 'bin').iterdir()) == {'sessiond', 'gatewayd', 'updater', 'agentd'}
+          assert all(p.read_bytes() == launcher for p in (root / 'bin').iterdir()), 'detached native binaries are not distributable'
+          assert not any(p.is_symlink() for p in root.rglob('*')), 'archive contains links'
+          PY
+          helper="$RUNNER_TEMP/wand-core/Wand Helper.app"
+          codesign --verify --strict --deep --test-requirement '=anchor apple generic and identifier "dev.wandapp.macos.helper" and certificate leaf[subject.OU] = "3C4HSZQCL5"' "$helper"
+          "$helper/Contents/MacOS/sessiond" --version
+          "$helper/Contents/MacOS/gatewayd" --protocol
+          if [ "$CHANNEL" = stable ]; then
+            xcrun stapler validate "$helper"
+            spctl --assess --type execute --verbose=2 "$helper"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: out-${{ matrix.platform }}
@@ -176,16 +226,15 @@ jobs:
           set -eu
           cd release
           # Order matters: the versioned release first (archives and manifest), the pointers last.
-          if gh release view "v$VERSION" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release v$VERSION already exists; releases are never overwritten" >&2; exit 1
-          fi
+          [ "$(gh release view "v$VERSION" -R "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)" = true ] \
+            || { echo 'only the prepared draft may be published' >&2; exit 1; }
           if [ "$CHANNEL" = beta ]; then flags="--prerelease --latest=false"; else flags="--latest"; fi
           # shellcheck disable=SC2086
-          gh release create "v$VERSION" -R "$GITHUB_REPOSITORY" --title "Wand Core $VERSION" \
-            --notes "Wand Core $VERSION (build $BUILD)" $flags \
-            "wand-core-$VERSION-macos-arm64.tar.gz" "wand-core-$VERSION-linux-x64.tar.gz" \
+          gh release upload "v$VERSION" -R "$GITHUB_REPOSITORY" \
+            "wand-core-$VERSION-linux-x64.tar.gz" \
             "wand-core-$VERSION-linux-arm64.tar.gz" "wand-web-$VERSION.tar.gz" \
             manifest.json manifest.json.sig
+          gh release edit "v$VERSION" -R "$GITHUB_REPOSITORY" --draft=false $flags
           # The Beta entry point always holds the newest manifest, stable or beta.
           if gh release view beta -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload beta -R "$GITHUB_REPOSITORY" manifest.json manifest.json.sig --clobber
