@@ -32,6 +32,9 @@ env:
 jobs:
   prepare:
     runs-on: ubuntu-24.04
+    # GitHub hides draft releases from tokens without push access.
+    permissions:
+      contents: write
     outputs:
       version: ${{ steps.v.outputs.version }}
       build: ${{ steps.v.outputs.build }}
@@ -90,6 +93,9 @@ jobs:
 
   build:
     needs: [prepare, test]
+    # The macOS verifier downloads the unpublished signed archive.
+    permissions:
+      contents: write
     strategy:
       fail-fast: true
       matrix:
