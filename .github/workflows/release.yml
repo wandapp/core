@@ -90,6 +90,10 @@ jobs:
           workspaces: src/core
       - run: cargo test --workspace --locked
         working-directory: src/core
+      - name: Test release artifact validation
+        run: |
+          python3 -m unittest discover -s src/release -p 'test_*.py'
+          python3 -m unittest discover -s src/dist -p 'test_publish.py'
 
   build:
     needs: [prepare, test]
@@ -129,6 +133,11 @@ jobs:
           [ -n "$UPDATE_PUBKEY" ] || { echo "repository variable UPDATE_PUBKEY is empty" >&2; exit 1; }
           printf '%s\n' "$UPDATE_PUBKEY" > "$RUNNER_TEMP/update.pub"
           WAND_UPDATE_PUBKEY_FILE="$RUNNER_TEMP/update.pub" src/dist/build.sh "$PLATFORM" >/dev/null
+          if [ "$PLATFORM" != web ]; then
+            python3 src/release/verify_core.py "src/output/wand-core-${{ needs.prepare.outputs.version }}-$PLATFORM.tar.gz" \
+              --version "${{ needs.prepare.outputs.version }}" --build "$WAND_CORE_BUILD" --platform "$PLATFORM" \
+              --channel "$WAND_CHANNEL" --commit "$(git -C src rev-parse HEAD)" --update-key "$RUNNER_TEMP/update.pub" --run-binaries
+          fi
           ls -l src/output
       - name: Verify the locally signed macOS archive
         if: matrix.platform == 'macos-arm64'
@@ -146,24 +155,14 @@ jobs:
           gh release download "v$VERSION" -R "$GITHUB_REPOSITORY" --pattern "$archive" --dir src/output
           actual=$(shasum -a 256 "src/output/$archive" | cut -d ' ' -f 1)
           [ "$actual" = "$MACOS_SHA256" ] || { echo 'macOS archive digest changed' >&2; exit 1; }
+          [ -n "$UPDATE_PUBKEY" ] || { echo 'UPDATE_PUBKEY is empty' >&2; exit 1; }
+          printf '%s\n' "$UPDATE_PUBKEY" > "$RUNNER_TEMP/update.pub"
+          python3 src/release/verify_core.py "src/output/$archive" --version "$VERSION" --build "$BUILD" \
+            --platform macos-arm64 --channel "$CHANNEL" --commit "$(git -C src rev-parse HEAD)" \
+            --update-key "$RUNNER_TEMP/update.pub" --run-binaries
+          # The shared gate checked archive paths and links before this extraction.
           tar -xzf "src/output/$archive" -C "$RUNNER_TEMP"
-          python3 - "$RUNNER_TEMP/wand-core" <<'PY'
-          import json, os, pathlib, re, subprocess, sys
-          root = pathlib.Path(sys.argv[1])
-          meta = json.loads((root / 'build.json').read_text())
-          head = subprocess.check_output(['git', '-C', 'src', 'rev-parse', 'HEAD'], text=True).strip()
-          assert re.fullmatch('[a-f0-9]{7,40}', meta['commit']) and head.startswith(meta['commit']), 'source commit mismatch'
-          assert (meta['version'], str(meta['build']), meta['platform'], meta['channel']) == (os.environ['VERSION'], os.environ['BUILD'], 'macos-arm64', os.environ['CHANNEL'])
-          assert (root / 'update-key.pub').read_text().strip() == os.environ['UPDATE_PUBKEY'].strip()
-          launcher = (root / 'macos-launcher.sh').read_bytes()
-          assert set(p.name for p in (root / 'bin').iterdir()) == {'sessiond', 'gatewayd', 'updater', 'agentd'}
-          assert all(p.read_bytes() == launcher for p in (root / 'bin').iterdir()), 'detached native binaries are not distributable'
-          assert not any(p.is_symlink() for p in root.rglob('*')), 'archive contains links'
-          PY
           helper="$RUNNER_TEMP/wand-core/Wand Helper.app"
-          codesign --verify --strict --deep --test-requirement '=anchor apple generic and identifier "dev.wandapp.macos.helper" and certificate leaf[subject.OU] = "3C4HSZQCL5"' "$helper"
-          "$helper/Contents/MacOS/sessiond" --version
-          "$helper/Contents/MacOS/gatewayd" --protocol
           if [ "$CHANNEL" = stable ]; then
             xcrun stapler validate "$helper"
             spctl --assess --type execute --verbose=2 "$helper"
@@ -205,14 +204,15 @@ jobs:
         run: |
           set -eu
           [ -n "$UPDATE_KEY" ] || { echo "secret UPDATE_KEY is empty in environment $CHANNEL" >&2; exit 1; }
-          # publish.py needs runnable gatewayd and updater: take them from the linux-x64 bundle.
+          # Validate all four signing binaries from the already verified linux-x64 bundle.
           tar -xzf "src/output/wand-core-$VERSION-linux-x64.tar.gz" -C "$RUNNER_TEMP"
           umask 077
           printf '%s\n' "$UPDATE_KEY" > "$RUNNER_TEMP/update.key"
           python3 src/dist/publish.py --key "$RUNNER_TEMP/update.key" --out release \
             --core-version "$VERSION" --core-build "$BUILD" --web-version "$VERSION" --web-build "$BUILD" \
             --url-base "https://github.com/wandapp/core/releases/download/v$VERSION" \
-            --channel "$CHANNEL" --bin-dir "$RUNNER_TEMP/wand-core/bin" >/dev/null
+            --channel "$CHANNEL" --bin-dir "$RUNNER_TEMP/wand-core/bin" \
+            --source-commit "$(git -C src rev-parse HEAD)" --require-platforms macos-arm64 linux-x64 linux-arm64 >/dev/null
           rm -f "$RUNNER_TEMP/update.key"
           # Verify the signature the way hosts do: the updater against a throwaway prefix pinned to the public key.
           mkdir -p "$RUNNER_TEMP/prefix"
